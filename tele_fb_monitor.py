@@ -25,7 +25,7 @@ CHECK_INTERVAL_SEC = 300  # chu kỳ kiểm tra định kỳ (giây)
 # ===== Phân quyền =====
 # Thay bằng user_id Telegram của bạn (có thể nhiều id)
 OWNER_IDS = {
-    123456789,  # ví dụ
+    @bearcoldly4444,  # ví dụ
 }
 
 def is_admin(user_id: int) -> bool:

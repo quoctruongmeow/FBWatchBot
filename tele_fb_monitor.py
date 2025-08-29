@@ -1,4 +1,5 @@
-import os, re, sqlite3, time, html, threading, logging
+# tele_fb_monitor.py
+import os, re, sqlite3, time, html, threading, logging, traceback
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -10,25 +11,25 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import Conflict
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, CallbackQueryHandler,
     ConversationHandler, MessageHandler, filters
 )
 
 # ===================== LOGGING =====================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
 LOGGER = logging.getLogger("FBWatchBot")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 
 # ===================== CONFIG =====================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "fbwatch.db"
-CHECK_INTERVAL_SEC = 300  # chu kỳ check định kỳ (giây)
+CHECK_INTERVAL_SEC = 300  # chu kỳ check định kỳ
 
 def _parse_ids(s: str | None):
     if not s:
@@ -39,8 +40,8 @@ def _parse_ids(s: str | None):
             out.append(int(tok))
     return out
 
-OWNER_IDS_SEED = _parse_ids(os.getenv("OWNER_IDS"))  # ví dụ: "111,222"
-USER_IDS_SEED  = _parse_ids(os.getenv("USER_IDS"))   # ví dụ: "333 444"
+OWNER_IDS_SEED = _parse_ids(os.getenv("OWNER_IDS"))  # "111,222"
+USER_IDS_SEED  = _parse_ids(os.getenv("USER_IDS"))   # "333 444"
 
 HEADERS = {
     "User-Agent": (
@@ -50,7 +51,7 @@ HEADERS = {
     "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# Chỉ coi DIE khi thấy cụm chết rõ ràng (login-wall không bị coi là DIE)
+# Chỉ coi những cụm này là DIE (login wall/private KHÔNG coi là DIE)
 DEAD_PHRASES = [
     "this content isn't available right now",
     "this page isn't available",
@@ -75,7 +76,11 @@ def now_iso():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout + WAL để giảm “database is locked”
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
     conn.execute("""
     CREATE TABLE IF NOT EXISTS allowed(
         user_id INTEGER PRIMARY KEY,
@@ -101,7 +106,7 @@ def db():
         FOREIGN KEY(uid) REFERENCES profiles(uid) ON DELETE CASCADE
     )
     """)
-    # migrations
+    # migrations (an toàn)
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(subscriptions)").fetchall()]
         if "note" not in cols:
@@ -134,7 +139,7 @@ def is_admin(user_id: int) -> bool:
     return get_role(user_id) == "admin"
 
 def is_allowed(user_id: int) -> bool:
-    return get_role(user_id) in ("admin","user")
+    return get_role(user_id) in ("admin", "user")
 
 def grant_role(user_id: int, role: str):
     role = "admin" if role == "admin" else "user"
@@ -316,6 +321,27 @@ def card_alert(uid, note, customer, url, old, new):
     )
 
 
+# ===================== ERROR HANDLER =====================
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Bỏ qua Conflict do trùng getUpdates để đỡ spam
+    if isinstance(context.error, Conflict):
+        LOGGER.warning("Ignoring Conflict: %s", context.error)
+        return
+
+    tb = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+    snap = repr(update)[:2000] if update is not None else "None"
+    LOGGER.error("Unhandled exception in handler\n%s\nUpdate snapshot: %s", tb, snap)
+
+    # Báo admin đầu tiên (nếu có)
+    if OWNER_IDS_SEED:
+        try:
+            msg = f"⚠️ Lỗi chưa xử lý:\n`{type(context.error).__name__}` – {str(context.error)}\n"
+            msg += "```\n" + tb[-3500:] + "\n```"
+            await context.bot.send_message(OWNER_IDS_SEED[0], msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            LOGGER.info("Failed to notify admin: %s", e)
+
+
 # ===================== ACCESS GUARD =====================
 def guard(require_admin: bool = False):
     async def _decorator(func):
@@ -342,8 +368,8 @@ def guard(require_admin: bool = False):
 
 # ===================== COMMANDS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    role = get_role(uid)
+    uid = update.effective_user.id if update.effective_user else None
+    role = get_role(uid) if uid else None
     if role in ("admin", "user"):
         await update.effective_message.reply_text(HELP, parse_mode=ParseMode.MARKDOWN)
     else:
@@ -420,7 +446,7 @@ async def them_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uid, url = normalize_target(target)
             status, name = fetch_status_and_name(url)
             if status is None:
-                status = "DIE"
+                status = "DIE"   # mặc định an toàn
             add_subscription(update.effective_chat.id, uid, url, note, customer, kind)
             set_profile_status(uid, name, status)
             kb = InlineKeyboardMarkup([
@@ -554,7 +580,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True
         )
-        time.sleep(0.4)
+        time.sleep(0.35)
 
 @guard()
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -611,39 +637,10 @@ def poll_once(application: Application):
         time.sleep(0.6)
 
 
-# ===================== ERROR HANDLER =====================
-def _admin_ids():
-    try:
-        con = db()
-        rows = con.execute("SELECT user_id FROM allowed WHERE role='admin'").fetchall()
-        con.close()
-        return [r[0] for r in rows]
-    except Exception:
-        return []
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    LOGGER.exception("Unhandled exception in handler", exc_info=context.error)
-    try:
-        text = (
-            "⚠️ *Bot gặp lỗi chưa xử lý*\n"
-            f"• Loại lỗi: `{type(context.error).__name__}`\n"
-            f"• Nội dung: `{str(context.error)[:400]}`"
-        )
-        for admin_id in _admin_ids():
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id, text=text, parse_mode=ParseMode.MARKDOWN
-                )
-            except TelegramError:
-                pass
-    except Exception:
-        pass
-
-
 # ===================== HEALTH CHECK HTTP =====================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/" or self.path == "/healthz":
+        if self.path in ("/", "/healthz"):
             self.send_response(200); self.end_headers()
             self.wfile.write(b"OK")
         else:
@@ -655,15 +652,6 @@ def run_health_server():
     server.serve_forever()
 
 
-# ===================== POST_INIT (XOÁ WEBHOOK) =====================
-async def post_init(application: Application):
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=False)
-        LOGGER.info("Webhook deleted (if any).")
-    except Exception as e:
-        LOGGER.info("Skip delete_webhook: %s", e)
-
-
 # ===================== MAIN =====================
 def main():
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
@@ -671,13 +659,10 @@ def main():
 
     seed_allowed_from_env()
 
-    # gắn post_init để xoá webhook an toàn trước khi polling
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # error handler
+    application = Application.builder().token(BOT_TOKEN).build()
     application.add_error_handler(error_handler)
 
-    # basic
+    # user-facing
     application.add_handler(CommandHandler(["start","trogiup","help"], help_cmd))
     application.add_handler(CommandHandler("myid", myid))
 
@@ -686,7 +671,7 @@ def main():
     application.add_handler(CommandHandler("revoke", revoke_cmd))
     application.add_handler(CommandHandler("who", who_cmd))
 
-    # /them conversation
+    # them conversation
     conv_them = ConversationHandler(
         entry_points=[CommandHandler("them", them_entry)],
         states={
@@ -700,23 +685,23 @@ def main():
     )
     application.add_handler(conv_them)
 
-    # các lệnh khác
+    # other user commands
     application.add_handler(CommandHandler("danhsach", list_cmd))
     application.add_handler(CommandHandler("xoa", remove_cmd))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    # scheduler định kỳ
+    # scheduler
     scheduler = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
     scheduler.add_job(lambda: poll_once(application), "interval",
                       seconds=CHECK_INTERVAL_SEC, max_instances=1)
     scheduler.start()
 
-    # health server (Render Free cần)
+    # health server
     threading.Thread(target=run_health_server, daemon=True).start()
 
-    print("Bot is running...")
+    LOGGER.info("Bot is running...")
     application.run_polling(close_loop=False)
 
 if __name__ == "__main__":
-    db()
+    db()  # ensure schema
     main()

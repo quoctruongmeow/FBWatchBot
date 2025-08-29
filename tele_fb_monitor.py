@@ -632,7 +632,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("trogiup", help_cmd))
-    application.add_handler(CommandHandler("myid", myid))        # 👈 thêm /myid
+    application.add_handler(CommandHandler("6868", myid))        # 👈 thêm /myid
     application.add_handler(conv_them)
     application.add_handler(CommandHandler("danhsach", list_cmd))
     application.add_handler(CommandHandler("xoa", remove_cmd))

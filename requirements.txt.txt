@@ -1,0 +1,5 @@
+python-telegram-bot==21.4
+APScheduler
+requests
+beautifulsoup4
+python-dotenv

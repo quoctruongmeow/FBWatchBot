@@ -655,28 +655,27 @@ def run_health_server():
     server.serve_forever()
 
 
-# ===================== MAIN =====================
-async def _delete_webhook_once(bot):
-    # Xoá webhook (nếu trước đây từng dùng), tránh xung đột getUpdates
+# ===================== POST_INIT (XOÁ WEBHOOK) =====================
+async def post_init(application: Application):
     try:
-        await bot.delete_webhook(drop_pending_updates=False)
+        await application.bot.delete_webhook(drop_pending_updates=False)
         LOGGER.info("Webhook deleted (if any).")
-    except Exception:
-        LOGGER.info("Skip delete_webhook.")
+    except Exception as e:
+        LOGGER.info("Skip delete_webhook: %s", e)
 
+
+# ===================== MAIN =====================
 def main():
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN không hợp lệ hoặc không nạp được từ .env")
 
     seed_allowed_from_env()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    # gắn post_init để xoá webhook an toàn trước khi polling
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # error handler
     application.add_error_handler(error_handler)
-
-    # xóa webhook khi khởi động
-    application.create_task(_delete_webhook_once(application.bot))
 
     # basic
     application.add_handler(CommandHandler(["start","trogiup","help"], help_cmd))
@@ -706,7 +705,7 @@ def main():
     application.add_handler(CommandHandler("xoa", remove_cmd))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    # scheduler
+    # scheduler định kỳ
     scheduler = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
     scheduler.add_job(lambda: poll_once(application), "interval",
                       seconds=CHECK_INTERVAL_SEC, max_instances=1)

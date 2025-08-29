@@ -1,3 +1,4 @@
+# tele_fb_monitor.py
 import os, re, sqlite3, time, html, threading
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
@@ -15,13 +16,13 @@ from telegram.ext import (
     ConversationHandler, MessageHandler, filters
 )
 
-# ==================== CONFIG ====================
+# =============== CONFIG ===============
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "fbwatch.db"
-CHECK_INTERVAL_SEC = 300  # chu kỳ poll DB (giây)
+CHECK_INTERVAL_SEC = 300  # chu kỳ poll định kỳ
 
-HEADERS = {
+DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -29,72 +30,68 @@ HEADERS = {
     "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# Cụm từ/triệu chứng thể hiện nội dung KHÔNG TỒN TẠI/không khả dụng (coi là DIE)
+# Cụm từ thể hiện “KHÔNG CÒN / KHÔNG KHẢ DỤNG”
 DEAD_PHRASES = [
     # EN
     "this content isn't available right now",
-    "this content is not available right now",
+    "content isn't available right now",
     "this page isn't available",
     "the link may be broken",
-    "content isn't available",
-    "content is no longer available",
-    "page not found",
+    "page isn't available",
     "the page you requested cannot be displayed right now",
-    "the page you requested was not found",
-    "account has been disabled",
-    "profile is unavailable",
-    "the link you followed may be broken or the page may have been removed",
+    "content not found",
+    "not available right now",
     # VI
     "trang bạn yêu cầu không thể hiển thị",
     "liên kết có thể đã bị hỏng",
     "bạn hiện không thể xem nội dung này",
     "nội dung này hiện không khả dụng",
     "rất tiếc, nội dung này hiện không khả dụng",
-    "bài viết không còn tồn tại",
-    "tài khoản này hiện không khả dụng",
-    "trang này hiện không tồn tại",
 ]
 
-# Conversation states
 ADD_UID, ADD_TYPE, ADD_NOTE, ADD_CUSTOMER = range(1, 5)
+UID_RE = re.compile(r"^\d{5,}$")
 
-# ==================== UTILS / DB ====================
+
+# =============== DB & UTILS ===============
 def now_iso():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
     CREATE TABLE IF NOT EXISTS profiles(
         uid TEXT PRIMARY KEY,
         url TEXT NOT NULL,
         name TEXT,
         last_status TEXT CHECK(last_status IN ('LIVE','DIE'))
-    )""")
-    conn.execute("""
+    )
+    """)
+    con.execute("""
     CREATE TABLE IF NOT EXISTS subscriptions(
         chat_id INTEGER NOT NULL,
         uid TEXT NOT NULL,
         note TEXT,
         customer TEXT,
-        kind TEXT,                 -- 'profile' | 'group'
+        kind TEXT,
         PRIMARY KEY(chat_id, uid),
         FOREIGN KEY(uid) REFERENCES profiles(uid) ON DELETE CASCADE
-    )""")
+    )
+    """)
     # migrate
     try:
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(subscriptions)").fetchall()]
+        cols = [r[1] for r in con.execute("PRAGMA table_info(subscriptions)").fetchall()]
         if "note" not in cols:
-            conn.execute("ALTER TABLE subscriptions ADD COLUMN note TEXT")
+            con.execute("ALTER TABLE subscriptions ADD COLUMN note TEXT")
         if "customer" not in cols:
-            conn.execute("ALTER TABLE subscriptions ADD COLUMN customer TEXT")
+            con.execute("ALTER TABLE subscriptions ADD COLUMN customer TEXT")
         if "kind" not in cols:
-            conn.execute("ALTER TABLE subscriptions ADD COLUMN kind TEXT")
+            con.execute("ALTER TABLE subscriptions ADD COLUMN kind TEXT")
     except Exception:
         pass
-    return conn
+    return con
 
-def add_subscription(chat_id:int, uid:str, url:str, note:str|None=None, customer:str|None=None, kind:str|None="profile"):
+def add_subscription(chat_id:int, uid:str, url:str, note=None, customer=None, kind="profile"):
     con = db()
     con.execute("INSERT OR IGNORE INTO profiles(uid,url) VALUES(?,?)", (uid,url))
     con.execute("""
@@ -140,11 +137,11 @@ def subscribers_of(uid:str):
     rows = [r[0] for r in con.execute("SELECT chat_id FROM subscriptions WHERE uid=?", (uid,)).fetchall()]
     con.close(); return rows
 
-UID_RE = re.compile(r'^\d{5,}$')
 
+# =============== NORMALIZE TARGET ===============
 def normalize_target(s: str):
     """
-    Nhận UID hoặc URL Facebook cho profile, page, group.
+    Nhận UID hoặc URL FB (profile/page/group).
     Trả về (uid_or_slug, mbasic_url).
     """
     s = s.strip()
@@ -173,83 +170,127 @@ def normalize_target(s: str):
             url = f"https://mbasic.facebook.com/{uid}"
         return uid, url
 
-# ----------------- FETCH HELPERS -----------------
-def _try_fetch(url: str, headers: dict, timeout: int) -> tuple[str|None, str|None, str]:
-    """
-    Trả về (status, name, final_url):
-      - "DIE" nếu có thông điệp không khả dụng hoặc bị đẩy tới login.
-      - "LIVE" nếu không có dấu hiệu DIE.
-      - (None, None, url) nếu lỗi mạng / không kết luận được.
-    """
+
+# =============== FETCH STATUS (đã sửa logic) ===============
+def _has_positive_cues(text_lower: str, soup: BeautifulSoup) -> bool:
+    """Các tín hiệu chứng minh trang tồn tại thực sự."""
+    # vài cue chữ (VI/EN)
+    cues = [
+        "add friend", "follow", "followers", "friends",
+        "bạn bè", "theo dõi", "người theo dõi", "giới thiệu",
+        "about", "photos", "ảnh", "bài viết", "dòng thời gian",
+        "join group", "tham gia nhóm", "public group", "private group",
+        "page transparency", "fanpage",
+    ]
+    if any(c in text_lower for c in cues):
+        return True
+
+    # meta og:type/profile/page v.v…
+    og_type = soup.find("meta", attrs={"property": "og:type"})
+    if og_type and og_type.get("content"):
+        if any(k in og_type["content"].lower() for k in ["profile", "website", "page"]):
+            # login wall đôi khi cũng có, nhưng kết hợp với tên sẽ chắc hơn
+            pass
+
+    # tên (og:title hoặc <title> không phải “facebook / login…”)
+    name = None
+    og = soup.find("meta", attrs={"property": "og:title"})
+    if og and og.get("content"):
+        name = og["content"].strip()
+    if not name and soup.title and soup.title.text:
+        t = soup.title.text.strip()
+        low = t.lower()
+        if all(k not in low for k in ["facebook", "log in", "đăng nhập"]):
+            name = t
+    return bool(name)
+
+def _try_fetch_once(url: str, headers: dict, timeout: int) -> tuple[str|None, str|None, str]:
+    """Trả (status, name, final_url) hoặc (None, None, final_url) nếu không kết luận."""
     try:
         r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
         final = r.url.lower()
-        text_lower = r.text.lower()
-
-        # 1) HTTP 404/410 ⇒ chết rõ ràng
+        # Lỗi HTTP rõ ràng
         if r.status_code in (404, 410):
             return "DIE", None, final
 
-        # 2) Cụm từ không khả dụng ⇒ DIE
+        text_lower = r.text.lower()
+
+        # Nếu có cụm từ chết → DIE
         if any(phrase in text_lower for phrase in DEAD_PHRASES):
             return "DIE", None, final
 
-        # 3) Login-wall/redirect login ⇒ coi là DIE
-        login_patterns = (
-            "/login.php", "/login/?", "log in to facebook", "đăng nhập facebook",
-            "you must log in", "m.facebook.com/login", "mbasic.facebook.com/login",
-        )
-        if any(p in final for p in login_patterns) or any(p in text_lower for p in login_patterns):
-            return "DIE", None, final
-
-        # 4) Không thấy dấu hiệu DIE → lấy tên (nếu có) và trả LIVE
         soup = BeautifulSoup(r.text, "html.parser")
-        name = None
-        og = soup.find("meta", attrs={"property": "og:title"})
-        if og and og.get("content"):
-            name = og["content"].strip()
-        if not name and soup.title and soup.title.text:
-            t = soup.title.text.strip()
-            low = t.lower()
-            if not any(k in low for k in ("facebook", "log in")):
-                name = t
 
-        return "LIVE", name, final
+        # Nếu URL đẩy về /login và không có cue dương tính → không kết luận
+        if "/login/" in final or "/login.php" in final:
+            if _has_positive_cues(text_lower, soup):
+                # login wall nhưng vẫn tìm thấy cue tồn tại → LIVE
+                return "LIVE", None, final
+            return None, None, final
+
+        # Không phải login → cần cue dương tính để khẳng định LIVE
+        if _has_positive_cues(text_lower, soup):
+            # cố lấy tên (không có cũng không sao)
+            name = None
+            og = soup.find("meta", attrs={"property": "og:title"})
+            if og and og.get("content"):
+                name = og["content"].strip()
+            if not name and soup.title and soup.title.text:
+                t = soup.title.text.strip()
+                low = t.lower()
+                if all(k not in low for k in ["facebook", "log in", "đăng nhập"]):
+                    name = t
+            return "LIVE", name, final
+
+        # Không chết, không cue dương tính → không kết luận
+        return None, None, final
 
     except Exception:
         return None, None, url
 
-def fetch_status_and_name(url: str, timeout: int = 20):
+def _variants_for(uid: str|None, base_url: str) -> list[str]:
+    """Sinh các biến thể URL để kiểm tra kỹ hơn."""
+    urls = set()
+    urls.add(base_url)
+    # hoán đổi m/mbasic/www
+    if "mbasic.facebook" in base_url:
+        urls.add(base_url.replace("mbasic.facebook", "m.facebook"))
+    if "m.facebook" in base_url:
+        urls.add(base_url.replace("m.facebook", "www.facebook"))
+        urls.add(base_url.replace("m.facebook", "mbasic.facebook"))
+    if "www.facebook" in base_url:
+        urls.add(base_url.replace("www.facebook", "m.facebook"))
+        urls.add(base_url.replace("www.facebook", "mbasic.facebook"))
+
+    # UID số → thử các form khác
+    if uid and UID_RE.match(uid):
+        urls.update({
+            f"https://www.facebook.com/profile.php?id={uid}",
+            f"https://m.facebook.com/profile.php?id={uid}",
+            f"https://mbasic.facebook.com/profile.php?id={uid}",
+            f"https://www.facebook.com/p/{uid}/",
+            f"https://m.facebook.com/p/{uid}/",
+        })
+    return list(urls)
+
+def fetch_status_and_name(url: str, uid: str|None = None, timeout: int = 20):
     """
-    Thử lần lượt: mbasic → m.facebook → www.facebook (UA crawler).
+    Trả (LIVE|DIE|None, name). None = không kết luận (mạng/login wall).
+    Chỉ trả LIVE khi có tín hiệu dương tính.
     """
-    # 1) mbasic
-    status, name, _ = _try_fetch(url, HEADERS, timeout)
-    if status is not None:
-        return status, name
-
-    # 2) m.facebook (hoặc ngược lại)
-    if "mbasic.facebook" in url:
-        alt = url.replace("mbasic.facebook", "m.facebook")
-    else:
-        alt = url.replace("m.facebook", "mbasic.facebook")
-    status, name, _ = _try_fetch(alt, HEADERS, timeout)
-    if status is not None:
-        return status, name
-
-    # 3) www.facebook + UA crawler
-    crawler_headers = {
-        **HEADERS,
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-    }
-    alt2 = alt.replace("m.facebook", "www.facebook").replace("mbasic.facebook", "www.facebook")
-    status, name, _ = _try_fetch(alt2, crawler_headers, timeout)
-    if status is not None:
-        return status, name
-
+    headers_list = [
+        DEFAULT_HEADERS,
+        {**DEFAULT_HEADERS, "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"},
+    ]
+    for candidate in _variants_for(uid, url):
+        for headers in headers_list:
+            status, name, _ = _try_fetch_once(candidate, headers, timeout)
+            if status is not None:
+                return status, name
     return None, None
 
-# ==================== UI / TEMPLATES ====================
+
+# =============== UI / TEMPLATES ===============
 HELP = (
 "✨ *FB Watch Bot*\n"
 "/them – Thêm từng bước (UID → Loại → Ghi chú → Tên KH)\n"
@@ -259,8 +300,7 @@ HELP = (
 "/trogiup – Hướng dẫn\n"
 )
 
-def line_box():
-    return "____________________________"
+def line_box(): return "____________________________"
 
 def card_added(uid, note, customer, kind, added_when, status, url):
     status_icon = "🟢 LIVE" if status=="LIVE" else "🔴 DIE"
@@ -294,19 +334,15 @@ def card_alert(uid, note, customer, url, old, new):
         f"{line_box()}"
     )
 
-# ==================== COMMANDS ====================
+
+# =============== COMMANDS ===============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Chào bạn!\n"+HELP, parse_mode=ParseMode.MARKDOWN)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(HELP, parse_mode=ParseMode.MARKDOWN)
 
-# ---- /them: hỗ trợ nhanh + wizard ----
 def parse_inline_add(text: str):
-    """
-    <uid/url> | <note> | <customer> | <profile|group>
-    (có thể thiếu 2-3 phần cuối; kind mặc định profile)
-    """
     parts = [p.strip() for p in text.split("|")]
     target = parts[0]
     note = parts[1] if len(parts) > 1 and parts[1] else None
@@ -317,18 +353,14 @@ def parse_inline_add(text: str):
     return target, note, customer, kind
 
 async def them_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # nếu gõ kèm tham số -> thêm nhanh
     if context.args:
         raw = " ".join(context.args)
         try:
             target, note, customer, kind = parse_inline_add(raw)
             uid, url = normalize_target(target)
-
-            # kiểm tra trạng thái thật
-            status, name = fetch_status_and_name(url)
+            status, name = fetch_status_and_name(url, uid)
             if status is None:
-                status = "DIE"  # mạng lỗi → coi DIE tạm thời
-
+                status = "DIE"
             add_subscription(update.effective_chat.id, uid, url, note, customer, kind)
             set_profile_status(uid, name, status)
 
@@ -347,10 +379,8 @@ async def them_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(f"❌ {e}")
         return ConversationHandler.END
 
-    # wizard bước 1: hỏi UID/URL
-    await update.effective_message.reply_text(
-        "➕ *Vui lòng nhập UID hoặc URL bạn muốn theo dõi:*", parse_mode=ParseMode.MARKDOWN
-    )
+    await update.effective_message.reply_text("➕ *Vui lòng nhập UID hoặc URL bạn muốn theo dõi:*",
+                                              parse_mode=ParseMode.MARKDOWN)
     context.user_data["add"] = {}
     return ADD_UID
 
@@ -364,26 +394,26 @@ async def them_got_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["add"]["uid"] = uid
     context.user_data["add"]["url"] = url
-
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("👤 Profile/Page", callback_data="type:profile"),
         InlineKeyboardButton("👥 Group", callback_data="type:group")
     ]])
     await update.effective_message.reply_text(
-        f"📌 *Chọn loại UID cho* `{uid}`:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+        f"📌 *Chọn loại UID cho* `{uid}`:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb
     )
     return ADD_TYPE
 
 async def them_pick_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data or ""
-    kind = "profile" if data != "type:group" else "group"
+    kind = "profile" if query.data != "type:group" else "group"
+    context.user_data["add"]["kind"] = kind
     await query.message.reply_text(
         f"✅ *Đã chọn loại:* {'Group' if kind=='group' else 'Profile/Page'}",
         parse_mode=ParseMode.MARKDOWN
     )
-    context.user_data["add"]["kind"] = kind
     uid = context.user_data["add"].get("uid")
     await query.message.reply_text(
         f"✍️ *Nhập ghi chú cho UID* `{uid}`\n_Ví dụ: Dame 282, unlock 282_",
@@ -407,10 +437,9 @@ async def them_got_customer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note, customer = info.get("note"), info.get("customer")
     kind = info.get("kind", "profile")
 
-    status, name = fetch_status_and_name(url)
+    status, name = fetch_status_and_name(url, uid)
     if status is None:
         status = "DIE"
-
     add_subscription(update.effective_chat.id, uid, url, note, customer, kind)
     set_profile_status(uid, name, status)
 
@@ -433,30 +462,26 @@ async def them_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Đã hủy.")
     return ConversationHandler.END
 
-# ==================== LIST / REMOVE ====================
+
+# =============== LIST / REMOVE ===============
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_subs(update.effective_chat.id)
     if not rows:
         await update.effective_message.reply_text("Chưa có UID nào. Dùng /them để bắt đầu.")
         return
-
-    for uid, _, prev_status, url, note, customer, kind in rows:
-        status, name = fetch_status_and_name(url)
+    for uid, _, prev, url, note, customer, kind in rows:
+        status, name = fetch_status_and_name(url, uid)
         if status is None:
-            status = prev_status if prev_status else "DIE"
+            status = prev if prev else "DIE"
         set_profile_status(uid, name, status)
 
         status_icon = "🟢 LIVE" if status=="LIVE" else "🔴 DIE"
-        note_display = note or "—"
-        customer_display = customer or "—"
-        kind_display = "Profile/Page" if (kind or "profile") == "profile" else "Group"
-
         text = (
             f"{line_box()}\n"
             f"🪪 *UID*: [{uid}]({url})\n"
-            f"📂 *Loại*: {kind_display}\n"
-            f"📝 *Ghi chú*: {html.escape(note_display)}\n"
-            f"🙍 *Khách hàng*: {html.escape(customer_display)}\n"
+            f"📂 *Loại*: {'Profile/Page' if (kind or 'profile')=='profile' else 'Group'}\n"
+            f"📝 *Ghi chú*: {html.escape(note or '—')}\n"
+            f"🙍 *Khách hàng*: {html.escape(customer or '—')}\n"
             f"📟 *Trạng thái*: {status_icon}\n"
             f"{line_box()}"
         )
@@ -470,7 +495,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, disable_web_page_preview=True
         )
-        time.sleep(0.5)
+        time.sleep(0.4)
 
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -480,11 +505,12 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remove_subscription(update.effective_chat.id, uid)
     await update.effective_message.reply_text(f"🗑️ Đã bỏ theo dõi {uid}")
 
-# ==================== BUTTONS & POLLER ====================
+
+# =============== BUTTONS & POLLER ===============
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = (query.data or "")
+    data = query.data or ""
     chat_id = query.message.chat.id if query.message else None
 
     if data.startswith("stop:"):
@@ -495,16 +521,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"🛑 Đã dừng theo dõi UID {uid}")
 
     elif data.startswith("keep:"):
-        uid = data.split(":",1)[1]
-        await query.message.reply_text(f"👌 Vẫn tiếp tục theo dõi UID {uid}")
+        # không cần làm gì thêm – chỉ đóng inline
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("✅ Vẫn tiếp tục theo dõi.")
 
 def poll_once(application: Application):
     for uid, url, prev in get_all_uids():
-        status, name = fetch_status_and_name(url)
+        status, name = fetch_status_and_name(url, uid)
         if status is None:
-            # lỗi mạng → giữ trạng thái cũ
             continue
-
         if prev != status:
             set_profile_status(uid, name, status)
             for chat_id in subscribers_of(uid):
@@ -535,29 +560,28 @@ def poll_once(application: Application):
         else:
             if name:
                 set_profile_status(uid, name, status)
-
         time.sleep(0.6)
 
-# ==================== HEALTH-CHECK HTTP ====================
-class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type","text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK")
-def start_health_server():
-    try:
-        srv = HTTPServer(("", 8080), _Health)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-    except Exception:
-        pass
 
-# ==================== MAIN ====================
+# =============== HTTP HEALTH CHECK ===============
+class _HC(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404); self.end_headers()
+
+def _start_healthcheck():
+    srv = HTTPServer(("0.0.0.0", 8080), _HC)
+    srv.serve_forever()
+
+# =============== MAIN ===============
 def main():
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN không hợp lệ hoặc không nạp được từ .env")
-
-    start_health_server()
+        raise RuntimeError("BOT_TOKEN không hợp lệ hoặc chưa được nạp từ .env")
+    threading.Thread(target=_start_healthcheck, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 

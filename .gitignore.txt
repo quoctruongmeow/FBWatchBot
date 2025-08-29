@@ -1,0 +1,20 @@
+# Không commit file cấu hình nhạy cảm
+.env
+
+# Không commit database local
+*.db
+
+# File Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env/
+.venv/
+
+# IDE / Editor config
+.vscode/
+.idea/

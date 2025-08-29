@@ -19,19 +19,20 @@ from telegram.ext import (
 # ================== CONFIG ==================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# Hardcode dự phòng (nếu không set OWNER_IDS env). Điền ID của bạn vào đây nếu muốn.
+OWNER_IDS_DEFAULT = { }  # ví dụ: {123456789}
+
+# Chủ động đọc từ biến môi trường: "12345,67890"
+_env_owners = {
+    int(x.strip()) for x in os.getenv("OWNER_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+OWNER_IDS = _env_owners or OWNER_IDS_DEFAULT
+
 DB_PATH = "fbwatch.db"
 CHECK_INTERVAL_SEC = 300  # chu kỳ kiểm tra định kỳ (giây)
 
-# ===== Phân quyền =====
-# Thay bằng user_id Telegram của bạn (có thể nhiều id)
-OWNER_IDS = {
-    6886,  # ví dụ
-}
-
-def is_admin(user_id: int) -> bool:
-    return user_id in OWNER_IDS
-
-# UA & headers
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -40,7 +41,7 @@ HEADERS = {
     "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# Các cụm chỉ ra "không tồn tại/không khả dụng". Không coi login wall là DIE.
+# Những cụm thể hiện "không tồn tại/không khả dụng"
 DEAD_PHRASES = [
     # EN
     "this content isn't available right now",
@@ -60,14 +61,32 @@ DEAD_PHRASES = [
 # Conversation states
 ADD_UID, ADD_TYPE, ADD_NOTE, ADD_CUSTOMER = range(1, 5)
 
-# ================== DB & UTILS ==================
+# ================== AUTH HELPERS ==================
+def is_allowed(user_id: int) -> bool:
+    """Chỉ cho phép user_id trong OWNER_IDS."""
+    return user_id in OWNER_IDS
+
+async def guard(update: Update) -> bool:
+    """Gửi thông báo thiếu quyền nếu user không thuộc OWNER_IDS."""
+    user = update.effective_user
+    if user and is_allowed(user.id):
+        return True
+    msg = (
+        "⛔ Bạn chưa được cấp quyền sử dụng bot này.\n"
+        "Gõ /myid để lấy User ID và gửi cho admin để được cấp quyền."
+    )
+    if update.effective_message:
+        await update.effective_message.reply_text(msg)
+    return False
+
+# ================== UTILS/DB ==================
 def now_iso():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 def db():
-    con = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
     # profiles
-    con.execute("""
+    conn.execute("""
     CREATE TABLE IF NOT EXISTS profiles(
         uid TEXT PRIMARY KEY,
         url TEXT NOT NULL,
@@ -76,60 +95,29 @@ def db():
     )
     """)
     # subscriptions
-    con.execute("""
+    conn.execute("""
     CREATE TABLE IF NOT EXISTS subscriptions(
         chat_id INTEGER NOT NULL,
         uid TEXT NOT NULL,
         note TEXT,
         customer TEXT,
-        kind TEXT,
+        kind TEXT,                 -- 'profile' | 'group'
         PRIMARY KEY(chat_id, uid),
         FOREIGN KEY(uid) REFERENCES profiles(uid) ON DELETE CASCADE
     )
     """)
-    # whitelist người dùng
-    con.execute("""
-    CREATE TABLE IF NOT EXISTS allowed_users(
-        user_id INTEGER PRIMARY KEY,
-        added_at TEXT
-    )
-    """)
-    # migrate columns cho subscriptions (idempotent)
+    # migrate
     try:
-        cols = [r[1] for r in con.execute("PRAGMA table_info(subscriptions)").fetchall()]
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(subscriptions)").fetchall()]
         if "note" not in cols:
-            con.execute("ALTER TABLE subscriptions ADD COLUMN note TEXT")
+            conn.execute("ALTER TABLE subscriptions ADD COLUMN note TEXT")
         if "customer" not in cols:
-            con.execute("ALTER TABLE subscriptions ADD COLUMN customer TEXT")
+            conn.execute("ALTER TABLE subscriptions ADD COLUMN customer TEXT")
         if "kind" not in cols:
-            con.execute("ALTER TABLE subscriptions ADD COLUMN kind TEXT")
+            conn.execute("ALTER TABLE subscriptions ADD COLUMN kind TEXT")
     except Exception:
         pass
-    return con
-
-def is_allowed_user(user_id: int) -> bool:
-    if is_admin(user_id):  # owner luôn có quyền
-        return True
-    con = db()
-    row = con.execute("SELECT 1 FROM allowed_users WHERE user_id=?", (user_id,)).fetchone()
-    con.close()
-    return row is not None
-
-def add_allowed_user(user_id: int):
-    con = db()
-    con.execute("INSERT OR IGNORE INTO allowed_users(user_id, added_at) VALUES(?,?)",
-                (user_id, now_iso()))
-    con.commit(); con.close()
-
-def remove_allowed_user(user_id: int):
-    con = db()
-    con.execute("DELETE FROM allowed_users WHERE user_id=?", (user_id,))
-    con.commit(); con.close()
-
-def list_allowed_users():
-    con = db()
-    rows = con.execute("SELECT user_id, added_at FROM allowed_users ORDER BY added_at DESC").fetchall()
-    con.close(); return rows
+    return conn
 
 def add_subscription(chat_id:int, uid:str, url:str, note:str|None=None, customer:str|None=None, kind:str|None="profile"):
     con = db()
@@ -181,7 +169,8 @@ UID_RE = re.compile(r'^\d{5,}$')
 
 def normalize_target(s: str):
     """
-    Nhận UID hoặc URL Facebook cho profile/page/group. Trả về (uid_or_slug, mbasic_url).
+    Nhận UID hoặc URL Facebook cho profile, page, group.
+    Trả về (uid_or_slug, mbasic_url).
     """
     s = s.strip()
     if s.startswith("http"):
@@ -209,17 +198,14 @@ def normalize_target(s: str):
             url = f"https://mbasic.facebook.com/{uid}"
         return uid, url
 
-# --------------- fetch helpers ---------------
+# -------- fetch helpers --------
 def _try_fetch(url: str, headers: dict, timeout: int) -> tuple[str|None, str|None, str]:
-    """
-    Trả về (status, name, final_url) hoặc (None, None, final_url) khi lỗi mạng.
-    Strict DIE: nếu chứa DEAD_PHRASES, hoặc HTTP 404/410.
-    Nếu không xác định rõ DIE -> coi là LIVE (login wall/private).
-    """
+    """Trả về (status, name, final_url) hoặc (None, None, final_url) khi lỗi mạng."""
     try:
         r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
         final = r.url.lower()
 
+        # Lỗi HTTP 404/410 ⇒ chết rõ ràng
         if r.status_code in (404, 410):
             return "DIE", None, final
 
@@ -227,6 +213,7 @@ def _try_fetch(url: str, headers: dict, timeout: int) -> tuple[str|None, str|Non
         if any(phrase in text_lower for phrase in DEAD_PHRASES):
             return "DIE", None, final
 
+        # login wall/private: vẫn coi là LIVE (tồn tại)
         soup = BeautifulSoup(r.text, "html.parser")
         name = None
         og = soup.find("meta", attrs={"property": "og:title"})
@@ -235,18 +222,16 @@ def _try_fetch(url: str, headers: dict, timeout: int) -> tuple[str|None, str|Non
         if not name and soup.title and soup.title.text:
             t = soup.title.text.strip()
             low = t.lower()
-            if all(k not in low for k in ["facebook", "log in", "đăng nhập"]):
+            if all(k not in low for k in ["facebook", "log in"]):
                 name = t
-
         return "LIVE", name, final
-
     except Exception:
         return None, None, url
 
 def fetch_status_and_name(url: str, timeout: int = 20):
     """
-    Thử nhiều biến thể: mbasic -> m.facebook -> www.facebook với UA crawler.
-    Kết luận DIE chỉ khi thấy tín hiệu DIE rõ ràng (DEAD_PHRASES / 404/410).
+    Nới điều kiện: login wall vẫn coi là LIVE.
+    Thử lần lượt: mbasic → m.facebook → www.facebook với UA khác nhau.
     """
     # 1) mbasic
     status, name, _ = _try_fetch(url, HEADERS, timeout)
@@ -272,19 +257,18 @@ def fetch_status_and_name(url: str, timeout: int = 20):
     if status is not None:
         return status, name
 
-    return None, None  # lỗi mạng/cấm IP…
+    # lỗi mạng/cấm IP…: không kết luận được
+    return None, None
 
-# ================== UI / MSG ==================
+# ================== UI / TEMPLATES ==================
 HELP = (
-    "✨ *FB Watch Bot*\n"
-    "/them – Thêm từng bước (UID → Loại → Ghi chú → Tên KH)\n"
-    "/them <uid/url> | <ghi chú> | <tên KH> | <profile|group> – Thêm nhanh 1 dòng\n"
-    "/danhsach – Xem UID đang theo dõi (kiểm tra realtime)\n"
-    "/xoa <uid> – Bỏ theo dõi\n"
-    "/trogiup – Hướng dẫn\n"
-    "\n"
-    "👮 Quyền truy cập: chỉ user được admin cấp quyền mới dùng được.\n"
-    "Admin: /myid, /allow <user_id>, /deny <user_id>, /allowed"
+"✨ *FB Watch Bot*\n"
+"/them – Thêm từng bước (UID → Loại → Ghi chú → Tên KH)\n"
+"/them <uid/url> | <ghi chú> | <tên KH> | <profile|group> – Thêm nhanh 1 dòng\n"
+"/danhsach – Xem UID đang theo dõi (kiểm tra realtime)\n"
+"/xoa <uid> – Bỏ theo dõi\n"
+"/myid – Xem user_id của bạn\n"
+"/trogiup – Hướng dẫn\n"
 )
 
 def line_box():
@@ -322,84 +306,29 @@ def card_alert(uid, note, customer, url, old, new):
         f"{line_box()}"
     )
 
-# ================== GUARD (quyền) ==================
-async def guard(update: Update) -> bool:
-    user = update.effective_user
-    if user and is_allowed_user(user.id):
-        return True
-    if user:
-        await update.effective_message.reply_text(
-            "❌ Bạn chưa được cấp quyền dùng bot này.\n"
-            "Liên hệ admin để được mở quyền."
-        )
-    return False
-
 # ================== COMMANDS ==================
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user:
-        await update.effective_message.reply_text(
-            f"👤 user_id của bạn: `{user.id}`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text("❌ Chỉ admin mới dùng được lệnh này.")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Dùng: /allow <user_id>")
-        return
-    try:
-        uid = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text("user_id phải là số.")
-        return
-    add_allowed_user(uid)
-    await update.effective_message.reply_text(f"✅ Đã cấp quyền cho user_id: {uid}")
-
-async def deny_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text("❌ Chỉ admin mới dùng được lệnh này.")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Dùng: /deny <user_id>")
-        return
-    try:
-        uid = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text("user_id phải là số.")
-        return
-    remove_allowed_user(uid)
-    await update.effective_message.reply_text(f"🗑️ Đã thu hồi quyền của user_id: {uid}")
-
-async def allowed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text("❌ Chỉ admin mới dùng được lệnh này.")
-        return
-    rows = list_allowed_users()
-    if not rows:
-        await update.effective_message.reply_text("Danh sách rỗng.")
-        return
-    text = "👥 *Danh sách user được cấp quyền:*\n" + "\n".join(
-        [f"- `{uid}` (từ {ts})" for uid, ts in rows]
-    )
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
     await update.effective_message.reply_text("Chào bạn!\n"+HELP, parse_mode=ParseMode.MARKDOWN)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
     await update.effective_message.reply_text(HELP, parse_mode=ParseMode.MARKDOWN)
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None:
+        await update.effective_message.reply_text("Không lấy được User ID.")
+        return
+    await update.effective_message.reply_text(
+        f"🆔 User ID của bạn là: `{user_id}`\n"
+        f"👉 Gửi ID này cho admin để được cấp quyền.",
+        parse_mode="Markdown"
+    )
+
+# ---- /them: hỗ trợ nhanh + wizard ----
 def parse_inline_add(text: str):
     """
     <uid/url> | <note> | <customer> | <profile|group>
+    (có thể thiếu 2-3 phần cuối; kind mặc định profile)
     """
     parts = [p.strip() for p in text.split("|")]
     target = parts[0]
@@ -411,16 +340,20 @@ def parse_inline_add(text: str):
     return target, note, customer, kind
 
 async def them_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
+    if not await guard(update):
+        return ConversationHandler.END
+
     # nếu gõ kèm tham số -> thêm nhanh
     if context.args:
         raw = " ".join(context.args)
         try:
             target, note, customer, kind = parse_inline_add(raw)
             uid, url = normalize_target(target)
+            # kiểm tra trạng thái thật
             status, name = fetch_status_and_name(url)
             if status is None:
-                status = "DIE"
+                status = "DIE"  # không kết luận được → coi như DIE tạm thời
+            # lưu
             add_subscription(update.effective_chat.id, uid, url, note, customer, kind)
             set_profile_status(uid, name, status)
 
@@ -439,16 +372,15 @@ async def them_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(f"❌ {e}")
         return ConversationHandler.END
 
-    # Wizard
-    await update.effective_message.reply_text(
-        "➕ *Vui lòng nhập UID hoặc URL bạn muốn theo dõi:*",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    # wizard bước 1: hỏi UID/URL
+    await update.effective_message.reply_text("➕ *Vui lòng nhập UID hoặc URL bạn muốn theo dõi:*", parse_mode=ParseMode.MARKDOWN)
     context.user_data["add"] = {}
     return ADD_UID
 
 async def them_got_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return ConversationHandler.END
+    if not await guard(update):
+        return ConversationHandler.END
+
     text = (update.effective_message.text or "").strip()
     try:
         uid, url = normalize_target(text)
@@ -471,10 +403,12 @@ async def them_got_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADD_TYPE
 
 async def them_pick_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        await update.callback_query.answer("Bạn chưa được cấp quyền", show_alert=True)
+        return
+
     query = update.callback_query
     await query.answer()
-    if not await guard(update): 
-        return ConversationHandler.END
     data = query.data or ""
     kind = "profile"
     if data == "type:group":
@@ -492,7 +426,9 @@ async def them_pick_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADD_NOTE
 
 async def them_got_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return ConversationHandler.END
+    if not await guard(update):
+        return ConversationHandler.END
+
     context.user_data["add"]["note"] = (update.effective_message.text or "").strip()
     uid = context.user_data["add"].get("uid")
     await update.effective_message.reply_text(
@@ -502,7 +438,9 @@ async def them_got_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADD_CUSTOMER
 
 async def them_got_customer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return ConversationHandler.END
+    if not await guard(update):
+        return ConversationHandler.END
+
     context.user_data["add"]["customer"] = (update.effective_message.text or "").strip()
 
     info = context.user_data.get("add", {})
@@ -510,6 +448,7 @@ async def them_got_customer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note, customer = info.get("note"), info.get("customer")
     kind = info.get("kind", "profile")
 
+    # Kiểm tra trạng thái thật trước khi lưu
     status, name = fetch_status_and_name(url)
     if status is None:
         status = "DIE"
@@ -536,14 +475,18 @@ async def them_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Đã hủy.")
     return ConversationHandler.END
 
+# ================== LIST / REMOVE ==================
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
+    if not await guard(update):
+        return
+
     rows = list_subs(update.effective_chat.id)
     if not rows:
         await update.effective_message.reply_text("Chưa có UID nào. Dùng /them để bắt đầu.")
         return
 
     for uid, _, prev_status, url, note, customer, kind in rows:
+        # Kiểm tra realtime
         status, name = fetch_status_and_name(url)
         if status is None:
             status = prev_status if prev_status else "DIE"
@@ -579,7 +522,8 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         time.sleep(0.4)
 
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
+    if not await guard(update):
+        return
     if not context.args:
         await update.effective_message.reply_text("Dùng: /xoa <uid>")
         return
@@ -587,12 +531,16 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remove_subscription(update.effective_chat.id, uid)
     await update.effective_message.reply_text(f"🗑️ Đã bỏ theo dõi {uid}")
 
-# =============== BUTTONS & POLLER ===============
+# ================== BUTTONS & POLLER ==================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    if not await guard(update):
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await query.answer("Bạn chưa được cấp quyền", show_alert=True)
         return
+
+    await query.answer()
     data = (query.data or "")
     chat_id = query.message.chat.id if query.message else None
 
@@ -604,16 +552,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"🛑 Đã dừng theo dõi UID {uid}")
 
     elif data.startswith("keep:"):
-        # chỉ đóng inline buttons để gọn
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("✅ Vẫn tiếp tục theo dõi.")
+        uid = data.split(":",1)[1]
+        await query.answer("Tiếp tục theo dõi UID này", show_alert=False)
 
 def poll_once(application: Application):
-    # Dò toàn DB, phát cảnh báo khi đổi trạng thái
     for uid, url, prev in get_all_uids():
         status, name = fetch_status_and_name(url)
         if status is None:
-            continue  # mạng lỗi -> bỏ qua
+            continue
         if prev != status:
             set_profile_status(uid, name, status)
             for chat_id in subscribers_of(uid):
@@ -646,33 +592,32 @@ def poll_once(application: Application):
                 set_profile_status(uid, name, status)
         time.sleep(0.6)
 
-# =============== Health-check HTTP ===============
-class _Health(BaseHTTPRequestHandler):
+# ================== HEALTH CHECK HTTP ==================
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type","text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"OK")
+        if self.path == "/healthz":
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write(b"ok")
         else:
             self.send_response(404); self.end_headers()
 
-def start_health_server():
-    port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), _Health)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"[health] listening on :{port}")
+def serve_health():
+    try:
+        server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
+        server.serve_forever()
+    except Exception:
+        pass
 
 # ================== MAIN ==================
 def main():
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN không hợp lệ hoặc không nạp được từ .env")
 
-    start_health_server()  # cho Render
+    # HTTP healthcheck server
+    threading.Thread(target=serve_health, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversation /them
     conv_them = ConversationHandler(
         entry_points=[CommandHandler("them", them_entry)],
         states={
@@ -685,20 +630,14 @@ def main():
         allow_reentry=True,
     )
 
-    # public
-    application.add_handler(CommandHandler("myid", myid))
-    # admin
-    application.add_handler(CommandHandler("allow", allow_cmd))
-    application.add_handler(CommandHandler("deny", deny_cmd))
-    application.add_handler(CommandHandler("allowed", allowed_cmd))
-
-    application.add_handler(CommandHandler(["start","trogiup","menu"], help_cmd))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("trogiup", help_cmd))
+    application.add_handler(CommandHandler("myid", myid))        # 👈 thêm /myid
     application.add_handler(conv_them)
-    application.add_handler(CommandHandler(["danhsach"], list_cmd))
-    application.add_handler(CommandHandler(["xoa"], remove_cmd))
+    application.add_handler(CommandHandler("danhsach", list_cmd))
+    application.add_handler(CommandHandler("xoa", remove_cmd))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    # Scheduler background poll
     scheduler = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
     scheduler.add_job(lambda: poll_once(application), "interval",
                       seconds=CHECK_INTERVAL_SEC, max_instances=1)
@@ -708,5 +647,5 @@ def main():
     application.run_polling(close_loop=False)
 
 if __name__ == "__main__":
-    db()  # đảm bảo bảng sẵn sàng
+    db()
     main()

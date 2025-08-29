@@ -1,4 +1,4 @@
-import os, re, sqlite3, time, html, threading
+import os, re, sqlite3, time, html, threading, logging
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -10,19 +10,26 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, CallbackQueryHandler,
     ConversationHandler, MessageHandler, filters
 )
+
+# ===================== LOGGING =====================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+LOGGER = logging.getLogger("FBWatchBot")
 
 # ===================== CONFIG =====================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "fbwatch.db"
-CHECK_INTERVAL_SEC = 300  # chu kỳ check định kỳ
+CHECK_INTERVAL_SEC = 300  # chu kỳ check định kỳ (giây)
 
-# auth seeds
 def _parse_ids(s: str | None):
     if not s:
         return []
@@ -32,8 +39,8 @@ def _parse_ids(s: str | None):
             out.append(int(tok))
     return out
 
-OWNER_IDS_SEED = _parse_ids(os.getenv("OWNER_IDS"))
-USER_IDS_SEED  = _parse_ids(os.getenv("USER_IDS"))
+OWNER_IDS_SEED = _parse_ids(os.getenv("OWNER_IDS"))  # ví dụ: "111,222"
+USER_IDS_SEED  = _parse_ids(os.getenv("USER_IDS"))   # ví dụ: "333 444"
 
 HEADERS = {
     "User-Agent": (
@@ -43,7 +50,7 @@ HEADERS = {
     "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-# chỉ các cụm DIE rõ ràng (không coi login wall là DIE)
+# Chỉ coi DIE khi thấy cụm chết rõ ràng (login-wall không bị coi là DIE)
 DEAD_PHRASES = [
     "this content isn't available right now",
     "this page isn't available",
@@ -60,8 +67,8 @@ DEAD_PHRASES = [
 
 # Conversation states
 ADD_UID, ADD_TYPE, ADD_NOTE, ADD_CUSTOMER = range(1, 5)
-
 UID_RE = re.compile(r"^\d{5,}$")
+
 
 # ===================== DB & AUTH =====================
 def now_iso():
@@ -69,14 +76,12 @@ def now_iso():
 
 def db():
     conn = sqlite3.connect(DB_PATH)
-    # allowed users / roles
     conn.execute("""
     CREATE TABLE IF NOT EXISTS allowed(
         user_id INTEGER PRIMARY KEY,
         role TEXT CHECK(role IN ('admin','user')) NOT NULL
     )
     """)
-    # profiles
     conn.execute("""
     CREATE TABLE IF NOT EXISTS profiles(
         uid TEXT PRIMARY KEY,
@@ -85,7 +90,6 @@ def db():
         last_status TEXT CHECK(last_status IN ('LIVE','DIE'))
     )
     """)
-    # subscriptions
     conn.execute("""
     CREATE TABLE IF NOT EXISTS subscriptions(
         chat_id INTEGER NOT NULL,
@@ -115,7 +119,6 @@ def seed_allowed_from_env():
     for uid in OWNER_IDS_SEED:
         con.execute("INSERT OR REPLACE INTO allowed(user_id, role) VALUES(?, 'admin')", (uid,))
     for uid in USER_IDS_SEED:
-        # đừng downgrade admin nếu trùng
         cur = con.execute("SELECT role FROM allowed WHERE user_id=?", (uid,)).fetchone()
         if not cur:
             con.execute("INSERT OR REPLACE INTO allowed(user_id, role) VALUES(?, 'user')", (uid,))
@@ -131,7 +134,7 @@ def is_admin(user_id: int) -> bool:
     return get_role(user_id) == "admin"
 
 def is_allowed(user_id: int) -> bool:
-    return get_role(user_id) in ("admin", "user")
+    return get_role(user_id) in ("admin","user")
 
 def grant_role(user_id: int, role: str):
     role = "admin" if role == "admin" else "user"
@@ -143,6 +146,7 @@ def revoke_user(user_id: int):
     con = db()
     con.execute("DELETE FROM allowed WHERE user_id=?", (user_id,))
     con.commit(); con.close()
+
 
 # ===================== WATCH DB HELPERS =====================
 def add_subscription(chat_id:int, uid:str, url:str, note:str|None=None, customer:str|None=None, kind:str|None="profile"):
@@ -190,6 +194,7 @@ def subscribers_of(uid:str):
     con = db()
     rows = [r[0] for r in con.execute("SELECT chat_id FROM subscriptions WHERE uid=?", (uid,)).fetchall()]
     con.close(); return rows
+
 
 # ===================== FB STATUS DETECTION =====================
 def normalize_target(s: str):
@@ -263,6 +268,7 @@ def fetch_status_and_name(url: str, timeout: int = 20):
 
     return None, None
 
+
 # ===================== UI TEXT =====================
 HELP = (
 "✨ *FB Watch Bot*\n"
@@ -309,6 +315,7 @@ def card_alert(uid, note, customer, url, old, new):
         f"{line_box()}"
     )
 
+
 # ===================== ACCESS GUARD =====================
 def guard(require_admin: bool = False):
     async def _decorator(func):
@@ -331,6 +338,7 @@ def guard(require_admin: bool = False):
             return await func(update, context, *args, **kwargs)
         return _wrapped
     return _decorator
+
 
 # ===================== COMMANDS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,7 +420,7 @@ async def them_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uid, url = normalize_target(target)
             status, name = fetch_status_and_name(url)
             if status is None:
-                status = "DIE"   # mặc định an toàn
+                status = "DIE"
             add_subscription(update.effective_chat.id, uid, url, note, customer, kind)
             set_profile_status(uid, name, status)
             kb = InlineKeyboardMarkup([
@@ -602,6 +610,36 @@ def poll_once(application: Application):
                 set_profile_status(uid, name, status)
         time.sleep(0.6)
 
+
+# ===================== ERROR HANDLER =====================
+def _admin_ids():
+    try:
+        con = db()
+        rows = con.execute("SELECT user_id FROM allowed WHERE role='admin'").fetchall()
+        con.close()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    LOGGER.exception("Unhandled exception in handler", exc_info=context.error)
+    try:
+        text = (
+            "⚠️ *Bot gặp lỗi chưa xử lý*\n"
+            f"• Loại lỗi: `{type(context.error).__name__}`\n"
+            f"• Nội dung: `{str(context.error)[:400]}`"
+        )
+        for admin_id in _admin_ids():
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id, text=text, parse_mode=ParseMode.MARKDOWN
+                )
+            except TelegramError:
+                pass
+    except Exception:
+        pass
+
+
 # ===================== HEALTH CHECK HTTP =====================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -616,7 +654,16 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
+
 # ===================== MAIN =====================
+async def _delete_webhook_once(bot):
+    # Xoá webhook (nếu trước đây từng dùng), tránh xung đột getUpdates
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        LOGGER.info("Webhook deleted (if any).")
+    except Exception:
+        LOGGER.info("Skip delete_webhook.")
+
 def main():
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN không hợp lệ hoặc không nạp được từ .env")
@@ -624,6 +671,12 @@ def main():
     seed_allowed_from_env()
 
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # error handler
+    application.add_error_handler(error_handler)
+
+    # xóa webhook khi khởi động
+    application.create_task(_delete_webhook_once(application.bot))
 
     # basic
     application.add_handler(CommandHandler(["start","trogiup","help"], help_cmd))
@@ -634,7 +687,7 @@ def main():
     application.add_handler(CommandHandler("revoke", revoke_cmd))
     application.add_handler(CommandHandler("who", who_cmd))
 
-    # them conversation
+    # /them conversation
     conv_them = ConversationHandler(
         entry_points=[CommandHandler("them", them_entry)],
         states={
@@ -648,7 +701,7 @@ def main():
     )
     application.add_handler(conv_them)
 
-    # other user commands
+    # các lệnh khác
     application.add_handler(CommandHandler("danhsach", list_cmd))
     application.add_handler(CommandHandler("xoa", remove_cmd))
     application.add_handler(CallbackQueryHandler(button_handler))
@@ -659,12 +712,12 @@ def main():
                       seconds=CHECK_INTERVAL_SEC, max_instances=1)
     scheduler.start()
 
-    # health server
+    # health server (Render Free cần)
     threading.Thread(target=run_health_server, daemon=True).start()
 
     print("Bot is running...")
     application.run_polling(close_loop=False)
 
 if __name__ == "__main__":
-    db()  # ensure schema
+    db()
     main()
